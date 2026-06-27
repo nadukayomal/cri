@@ -135,5 +135,44 @@ class LLMClient:
             overflow_handled = fit_meta.get("overflow", False)
             token_counts = count_messages_tokens(messages, self.provider, self.model, context_strs)
 
+            retry_count = 0
+            total_backoff_ms = 0
+            last_error = None
 
-            ## Need to continue from here LM clien line 176
+            for attempt in range(self.max_retries + 1):
+                try:
+                    start_time = time.time()
+
+                    if self.provider == "openai":
+                        response = self._call_openai(messages, temperature, max_tokens, **kwargs)
+                    elif self.provider == "google":
+                        response = self._call_google(messages, temperature, max_tokens, **kwargs)
+                    elif self.provider == "groq":
+                        response = self._call_groq(messages, temperature, max_tokens, **kwargs)
+                    else:
+                        raise ValueError(f"Unsupported provider: {self.provider}")
+
+                    latency_ms = int((time.time() - start_time) * 1000)
+
+                    text = response["text"]
+                    provider_usage = response.get("usage")
+
+                    usage = reconcile_usage(token_counts, provider_usage)
+
+                    return {
+                            "text": text,
+                            "usage": usage,
+                            "latency_ms": latency_ms,
+                            "raw": response.get("raw"),
+                            "meta": {
+                                    "retry_count": retry_count,
+                                    "backoff_ms_total": total_backoff_ms,
+                                    "overflow_handled": overflow_handled
+                                    }
+                            }
+
+                except Exception as e:
+                    last_err = e
+
+                    
+                    pass
