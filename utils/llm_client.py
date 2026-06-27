@@ -1,7 +1,9 @@
 from decimal import Overflow
+from inspect import Parameter
 import os
 import time
 import random
+from httpx import Response
 from openai import OpenAI, OpenAIError, api_key
 from google import genai
 from google.genai import types
@@ -174,5 +176,178 @@ class LLMClient:
                 except Exception as e:
                     last_err = e
 
-                    
-                    pass
+                    if attempt < self.max_retries and self._is_retryable_error(e):
+                        retry_count += 1
+                        backoff_sec = self._calculate_backoff(attempt)
+                        backoff_ms = int(backoff_sec * 1000)
+                        total_backoff_ms += backoff_ms
+
+                        time.sleep(backoff_sec)
+                        continue
+
+                    error_str = str(e).lower()
+
+                    if ( 
+                            "context" in error_str
+                            and ("length" in error_str or "too long" in error_str)
+                            and not overflow_handled
+                        ):
+
+                        raise ValueError("Context window exceeded. Use overflow_summarize.v1 prompt.") from e
+
+                    raise
+
+                raise last_error or Exception("Unknown error in LLM call")
+
+    def _call_openai(self, messages, temperature, max_tokens, **kwargs):
+
+        params = {
+                    "model" : self.model,
+                    "messages" : messages
+                    }
+
+        is_reasoning_model = any(self.model.startswith(prefix) for prefix in ["o1-", "o3-"])
+
+        if temperature is not None and not is_reasoning_model:
+            params["temperature"] = temperature
+        
+        if max_tokens is not None:
+            if is_reasoning_model:
+                params["max-completion_tokens"] = max_tokens
+            else:
+                params["max_tokens"] = max_tokens
+
+        params.update(kwargs)
+
+        response = self.client.chat.completions.create(**params)
+
+        return {
+                    "text": response.choices[0].message.content or "",
+                    "usage": {
+                        "prompt_tokens": response.usage.prompt_tokens if response.usage else None,
+                        "completion_tokens": response.usage.completion_tokens if response.usage else None,
+                        "total_tokens": response.usage.total_tokens if response.usage else None,
+                    },
+                    "raw": response,
+                }
+
+    def _call_google(self, messages, temperature, max_tokens, **kwargs):
+        """Call Google Gemini API using new google-genai SDK."""
+
+        gemini_contents = []
+        system_instruction = None
+
+        for msg in messages:
+            role = msg["role"]
+            content = msg["content"]
+
+            if role == "system":
+                system_instruction = content
+            elif role == "user":
+                gemini_contents.append(
+                    types.content(role = "user", parts = [types.Part.from_text(text=content)])
+                )
+            elif role == "assistant":
+                gemini_contents.append(
+                    types.Content(role="model", parts=[types.Part.from_text(text=content)])
+                )
+        
+        # Build generation config
+        config_params = {}
+
+        if temperature is not None:
+            config_params["temperature"] = temperature
+        if max_tokens is not None:
+            config_params["max_output_tokens"] = max_tokens
+        if system_instruction:
+            config_params["system_instruction"] = system_instruction
+
+        generation_config = types.GenerateContentConfig(**config_params) if config_params else None
+
+        # Generate content using new client API
+        response = self.client.models.generate_content(
+                                                            model=self.model,
+                                                            contents=gemini_contents,
+                                                            config=generation_config,
+                                                        )
+
+        # Extract usage metadata
+        usage = {}
+
+        if hasattr(response, "usage_metadata") and response.usage_metadata:
+            usage = {
+                        "promptTokenCount": response.usage_metadata.prompt_token_count,
+                        "candidatesTokenCount": response.usage_metadata.candidates_token_count,
+                    }
+
+        return {
+                    "text": response.text,
+                    "usage": usage,
+                    "raw": response,
+                }
+
+    def _call_groq(self, messages, temperature,  max_tokens, **kwargs):
+        """ Call Groq API (OpenAI-compatible) """
+
+        params = {
+            "model": self.model,
+            "messages": messages,
+        }
+
+        if temperature is not None:
+            params["temperature"] = temperature
+        if max_tokens is not None:
+            params["max_tokens"] = max_tokens
+
+        params.update(kwargs)
+
+        response = self.client.chat.completions.create(**params)
+
+        return {
+            "text": response.choices[0].message.content or "",
+            "usage": {
+                "prompt_tokens": response.usage.prompt_tokens if response.usage else None,
+                "completion_tokens": response.usage.completion_tokens if response.usage else None,
+                "total_tokens": response.usage.total_tokens if response.usage else None,
+            },
+            "raw": response,
+        }
+
+    def json_chat(self, messages, temperature = 0.0, **kwargs):
+        """
+        Chat with JSON mode enabled (where supported).
+
+        Returns same format as chat() but attempts to enforce JSON output.
+        """
+
+        if self.provider == "openai":
+            kwargs["response_format"] = {"type": "json_object"}
+
+        return self.chat(messages, temperature = temperature, **kwargs)
+
+    def tool_chat(self, messages, tools, temperature=0.2, **kwargs):
+        """
+        Chat with function calling / tools.
+
+        Args:
+            messages: Messages array
+            tools: Tool definitions in OpenAI format
+            temperature: Sampling temperature
+            **kwargs: Additional parameters
+
+        Returns:
+            Same format as chat() with potential tool_calls in raw response
+        """
+        
+        if self.provider == "openai":
+            kwargs["tools"] = tools
+            kwargs["tool_choice"] = "auto"
+        elif self.provider == "groq":
+            # Groq supports OpenAI-compatible function calling
+            kwargs["tools"] = tools
+            kwargs["tool_choice"] = "auto"
+        else:
+            # Fallback: embed tools in prompt (handled by caller using tool_call prompt)
+            pass
+
+        return self.chat(messages, temperature=temperature, **kwargs)
